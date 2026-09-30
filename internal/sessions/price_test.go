@@ -6,6 +6,8 @@ import (
 	"testing"
 
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/settings"
 )
 
 // A session's Grok model named at an effort is priced as its model; one no
@@ -30,5 +32,84 @@ func TestPriceOfGrokEffort(t *testing.T) {
 		if pr, ok := priceOf(m); ok {
 			t.Errorf("priceOf(%q) = %+v; want unpriced", m, pr)
 		}
+	}
+}
+
+// A session naming a model through a provider is priced at what the user set
+// for that provider and model; the same model named bare is still its maker's
+// list price, which is a different question from what one provider charges.
+func TestPriceOfStatedProviderPrice(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	os.MkdirAll(filepath.Dir(catalog.CachePath()), 0o755)
+	// a models.dev provider, because a model's maker is looked up among the
+	// presets: a made-up vendor would have no maker to fall back to, which is
+	// half of what this is checking
+	os.WriteFile(catalog.CachePath(), []byte(`{"openai":{"id":"openai","models":{
+	    "gpt-5.5":{"id":"gpt-5.5","cost":{"input":2,"output":10,"cache_read":0.25,"cache_write":2.5}}}}}`), 0o644)
+	catalog.Reset()
+	t.Cleanup(catalog.Reset)
+
+	if err := settings.Save(settings.Settings{ModelPrices: map[string]settings.ModelPrice{
+		"relay/gpt-5.5": {Input: new(float64(0.2)), Output: new(float64(1)),
+			CacheRead: new(float64(0.05)), CacheWrite: new(float64(0.25))},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	pr, ok := priceOf("relay/gpt-5.5")
+	if !ok || pr.Input != 0.2 || pr.Output != 1 || pr.CacheRead != 0.05 || pr.CacheWrite != 0.25 {
+		t.Errorf("priceOf(%q) = %+v, %v; want the stated $0.2/$1", "relay/gpt-5.5", pr, ok)
+	}
+
+	// bare, it is still what models.dev lists for the model's own maker
+	if pr, ok := priceOf("gpt-5.5"); !ok || pr.Input != 2 {
+		t.Errorf("priceOf(%q) = %+v, %v; want the maker's $2", "gpt-5.5", pr, ok)
+	}
+
+	// and the same model through a provider nobody priced is its maker's too
+	if pr, ok := priceOf("other/gpt-5.5"); !ok || pr.Input != 2 {
+		t.Errorf("priceOf(%q) = %+v, %v; want the maker's $2", "other/gpt-5.5", pr, ok)
+	}
+}
+
+// A session recorded before a provider was renamed still gets the configured
+// price. The record names the id the provider had then; the price is keyed by
+// the one it has now, and the lookup has to resolve the old id to get there —
+// otherwise an old session quietly falls back to a list price and reports a
+// different number from every session since the rename.
+func TestPriceOfAfterProviderRename(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	os.MkdirAll(filepath.Dir(catalog.CachePath()), 0o755)
+	os.WriteFile(catalog.CachePath(), []byte(`{"openai":{"id":"openai","models":{
+	    "gpt-5.5":{"id":"gpt-5.5","cost":{"input":2,"output":10}}}}}`), 0o644)
+	catalog.Reset()
+	t.Cleanup(catalog.Reset)
+
+	if err := provider.Save(provider.Provider{ID: "old", Name: "Old", Key: "k",
+		Chat: "https://old.example/v1", Models: []string{"gpt-5.5"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := provider.Rename("old", "new"); err != nil {
+		t.Fatal(err)
+	}
+	if err := settings.Save(settings.Settings{ModelPrices: map[string]settings.ModelPrice{
+		"new/gpt-5.5": {Input: new(float64(0.2)), Output: new(float64(1)),
+			CacheRead: new(float64(0)), CacheWrite: new(float64(0))},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	pr, ok := priceOf("old/gpt-5.5")
+	if !ok || pr.Input != 0.2 {
+		t.Fatalf("a session recorded under the old provider id: %+v %v; want the stated $0.2", pr, ok)
+	}
+	if pr, ok := priceOf("new/gpt-5.5"); !ok || pr.Input != 0.2 {
+		t.Fatalf("under the new id: %+v %v; want the stated $0.2", pr, ok)
 	}
 }

@@ -2,6 +2,7 @@ package settings
 
 import (
 	"encoding/json"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -351,5 +352,45 @@ func TestRenamePerModel(t *testing.T) {
 	}
 	if s.RenamePerModel("old", "new") {
 		t.Error("renaming again moved something")
+	}
+}
+
+// A price is usable only when every part is a number a vendor could charge.
+// JSON has no NaN or Infinity, so nothing reaches here from the file with
+// one; a price typed in, or passed in by a caller, still can, and a NaN
+// would sail past a < 0 check and poison every total it reached.
+func TestModelPriceNeedsEveryPartToBeAFiniteNumber(t *testing.T) {
+	nan, inf, ninf := math.NaN(), math.Inf(1), math.Inf(-1)
+	full := func(in, out, cr, cw *float64) ModelPrice {
+		return ModelPrice{Input: in, Output: out, CacheRead: cr, CacheWrite: cw}
+	}
+	ok := full(new(2.0), new(10.0), new(0.25), new(2.5))
+	if _, bad := ok.Price(); bad != "" {
+		t.Errorf("a price with every part given: named %q as bad", bad)
+	}
+	for _, tc := range []struct {
+		what string
+		m    ModelPrice
+		part string
+	}{
+		{"input missing", full(nil, new(1.0), new(0.1), new(0.1)), "input"},
+		{"output missing", full(new(1.0), nil, new(0.1), new(0.1)), "output"},
+		{"cache read missing", full(new(1.0), new(1.0), nil, new(0.1)), "cache_read"},
+		{"cache write missing", full(new(1.0), new(1.0), new(0.1), nil), "cache_write"},
+		{"input NaN", full(&nan, new(1.0), new(0.1), new(0.1)), "input"},
+		{"output NaN", full(new(1.0), &nan, new(0.1), new(0.1)), "output"},
+		{"input infinite", full(&inf, new(1.0), new(0.1), new(0.1)), "input"},
+		{"cache read infinite", full(new(1.0), new(1.0), &inf, new(0.1)), "cache_read"},
+		{"cache write negative infinite", full(new(1.0), new(1.0), new(0.1), &ninf), "cache_write"},
+		{"input negative", full(new(-1.0), new(1.0), new(0.1), new(0.1)), "input"},
+		{"output negative", full(new(1.0), new(-1.0), new(0.1), new(0.1)), "output"},
+	} {
+		if _, bad := tc.m.Price(); bad != tc.part {
+			t.Errorf("%s: named %q as the bad part, want %q", tc.what, bad, tc.part)
+		}
+	}
+	// zero is a price: a free model is one the vendor charges nothing for.
+	if _, bad := full(new(0.0), new(0.0), new(0.0), new(0.0)).Price(); bad != "" {
+		t.Errorf("a price of zero: named %q as bad", bad)
 	}
 }

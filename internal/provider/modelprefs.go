@@ -93,6 +93,52 @@ func SetModelName(ref, name string) error {
 	return nil
 }
 
+// SetModelPrice is what a provider's model costs the user, in USD per million
+// tokens, kept in settings' ModelPrices the way a name is. A nil price takes
+// the user's away, leaving the model at what its provider lists and only then
+// at its maker's on models.dev; a price of zero is not that, but a model
+// served at no cost. A price no vendor could charge is refused, naming the
+// part that is wrong.
+//
+// Unlike the other model preferences this does not tell the agents. What a
+// call costs is not what an agent picks a model by, and the model lists
+// magpie keeps in the agents' own files are not its to rewrite over a number
+// in a cost report.
+func SetModelPrice(id string, p *catalog.Price) error {
+	pr, model, err := splitRef(id)
+	if err != nil {
+		return err
+	}
+	// a price for a model the provider does not serve is a price that never
+	// applies and nothing later says so; the same refusal `magpie model
+	// name` makes for the same id. A removal is exempt, so an entry left for
+	// a model that has since gone can still be taken away.
+	if p != nil && model != "*" && !pr.serves(model) {
+		return fmt.Errorf("%s has no model %s (magpie provider %s lists them)", pr.ID, model, pr.ID)
+	}
+	// the entry is written under the id the provider has now, the way a name
+	// is: a key under a display name is a price the provider is never asked
+	// for, and nothing later would say so.
+	key := pr.ID + "/" + model
+	s := settings.Load()
+	if p == nil {
+		delete(s.ModelPrices, key)
+	} else {
+		m := settings.ModelPrice{
+			Input: new(p.Input), Output: new(p.Output),
+			CacheRead: new(p.CacheRead), CacheWrite: new(p.CacheWrite),
+		}
+		if err := settings.CheckModelPrice(key, m); err != nil {
+			return err
+		}
+		if s.ModelPrices == nil {
+			s.ModelPrices = map[string]settings.ModelPrice{}
+		}
+		s.ModelPrices[key] = m
+	}
+	return settings.Save(s)
+}
+
 // Levels are the reasoning levels a model whose own aren't known can be
 // given.
 var Levels = []string{"none", "minimal", "low", "medium", "high", "xhigh", "max"}

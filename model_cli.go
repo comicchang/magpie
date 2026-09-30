@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strconv"
 	"strings"
 
+	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/settings"
 )
@@ -20,13 +22,28 @@ const modelUsage = `usage:
   magpie model efforts <provider/model>          the reasoning levels it offers, and those it has
   magpie model efforts <provider/model> <l>,<l>  offer only these of them, e.g. low,medium,high
   magpie model efforts <provider/model> --reset  offer every level it has again
+  magpie model price <provider/model>             what the model costs you, and what you said it costs
+  magpie model price <provider/model> <in>,<out>,<cache read>,<cache write>
+                                                 say what it costs, in USD per million tokens, all four parts as
+                                                 0.12,1.20,0.01,0.15; 0 is a model served for nothing, which is
+                                                 a price, not the absence of one
+  magpie model price <provider/model> --reset     take your price off this model
+  magpie model prices                            the models you priced
   magpie model names                             the models you named or narrowed
+
+  Each is looked for in this order: this model, then <provider id>/*, then the provider's own
+  list, then models.dev. --reset removes only the first, and says so when a <provider id>/* value
+  still applies.
 
   Only what agents are shown changes: they still pick the model, and requests still reach it,
   as <provider/model>. The same model from another provider keeps its own name and levels.
+  A price is one provider's tariff for one model, not the model's own: it changes what the
+  usage and session totals report, and nothing an agent can see, and it is saved without
+  rewriting the model lists in the agents' own files.
 
   e.g. magpie model name claude/claude-opus-5-5 "Opus 5.5"
-       magpie model efforts openai/gpt-6 low,medium,high`
+       magpie model efforts openai/gpt-6 low,medium,high
+       magpie model price relay-a/gpt-5.5 0.12,0.60,0.01,0.15`
 
 func modelCmd(args []string) error {
 	if len(args) == 0 {
@@ -39,6 +56,10 @@ func modelCmd(args []string) error {
 		return modelName(args[1:])
 	case "efforts", "effort", "levels":
 		return modelEfforts(args[1:])
+	case "price", "cost":
+		return modelPrice(args[1:])
+	case "prices":
+		return modelPrices()
 	case "help", "-h", "--help":
 		fmt.Println(modelUsage)
 		return nil
@@ -163,6 +184,136 @@ func modelEfforts(args []string) error {
 		fmt.Println(green.Render("✓"), id, muted.Render("offers"), bold.Render(strings.Join(kept, ", ")))
 	} else {
 		fmt.Println(green.Render("✓"), id, muted.Render("offers every level it has"), faint.Render(strings.Join(all, ", ")))
+	}
+	return nil
+}
+
+// modelPrice shows what a provider's model is counted at, or sets what the
+// user says it costs in USD per million tokens. All four parts are given: a
+// price is a cost report, and one missing a part would understate it.
+func modelPrice(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("%s", modelUsage)
+	}
+	p, model, err := modelRef(args[0])
+	if err != nil {
+		return err
+	}
+	id := p.ID + "/" + model
+	rest := args[1:]
+	if len(rest) == 0 {
+		pr, ok := provider.EffectivePrice(p.ID, model)
+		if !ok {
+			fmt.Println(muted.Render(id), faint.Render("· no price is known for it"))
+			return nil
+		}
+		fmt.Println(bold.Render(perMillion(pr)), muted.Render("· "+id))
+		fmt.Println(faint.Render("  · cache read " + money(pr.CacheRead) + ", cache write " + money(pr.CacheWrite)))
+		switch priceFrom(settings.Load(), p.ID, model) {
+		case "model":
+			fmt.Println(faint.Render("  · what you said this model costs · --reset takes that away"))
+		case "provider":
+			fmt.Println(faint.Render("  · what you said every model of this provider costs · magpie model price " +
+				p.ID + "/* --reset takes that away"))
+		case "ignored":
+			fmt.Println(faint.Render("  · a price you gave is not usable and is ignored"))
+		default:
+			fmt.Println(faint.Render("  · what its provider lists, else its maker's on models.dev · magpie model price " +
+				id + " <in>,<out>,<cache read>,<cache write> to change it"))
+		}
+		return nil
+	}
+	if isReset(rest) {
+		if err := provider.SetModelPrice(id, nil); err != nil {
+			return err
+		}
+		if _, wide := statedPrice(settings.Load().ModelPrices, p.ID+"/*"); wide {
+			fmt.Println(green.Render("✓"), id,
+				muted.Render("no longer has a price of its own; it still costs what you set for every model of this provider"))
+		} else {
+			fmt.Println(green.Render("✓"), id,
+				muted.Render("no longer has a price of its own; it is costed at what its provider lists, or its maker's"))
+		}
+		return nil
+	}
+	var nums []float64
+	for _, a := range rest {
+		for _, f := range strings.FieldsFunc(a, func(r rune) bool { return r == ',' || r == ' ' || r == '/' }) {
+			v, err := strconv.ParseFloat(f, 64)
+			if err != nil {
+				return fmt.Errorf("a price is numbers in USD per million tokens, like 0.12,1.20,0.01,0.15, not %q", f)
+			}
+			nums = append(nums, v)
+		}
+	}
+	if len(nums) != 4 {
+		return fmt.Errorf("give all four parts, input,output,cache read,cache write — %d given", len(nums))
+	}
+	pr := catalog.Price{Input: nums[0], Output: nums[1], CacheRead: nums[2], CacheWrite: nums[3]}
+	if err := provider.SetModelPrice(id, &pr); err != nil {
+		return err
+	}
+	fmt.Println(green.Render("✓"), id, muted.Render("costs"), bold.Render(perMillion(pr)))
+	return nil
+}
+
+// perMillion is a price as the two numbers a reader wants first.
+func perMillion(p catalog.Price) string {
+	return fmt.Sprintf("$%.4g/$%.4g per 1M in/out", p.Input, p.Output)
+}
+
+// money is one part of a per-million price as a price tuple writes it.
+func money(v float64) string { return fmt.Sprintf("$%.4g", v) }
+
+// statedPrice is the usable price a "<provider id>/<model id>" key holds, if
+// it holds one at all. A key that is there with a part missing is not one:
+// it would bill the rest of a call at zero.
+func statedPrice(prices map[string]settings.ModelPrice, key string) (catalog.Price, bool) {
+	m, ok := prices[key]
+	if !ok {
+		return catalog.Price{}, false
+	}
+	p, bad := m.Price()
+	return p, bad == ""
+}
+
+// priceFrom says where a model's effective price came from: the price given
+// for it, the one given for every model of its provider, a price that is
+// there but unusable, or neither — which leaves the provider's own list price
+// and then its maker's. The order is the one EffectivePrice looks in.
+func priceFrom(s settings.Settings, providerID, model string) string {
+	if _, ok := statedPrice(s.ModelPrices, providerID+"/"+model); ok {
+		return "model"
+	}
+	if _, ok := statedPrice(s.ModelPrices, providerID+"/*"); ok {
+		return "provider"
+	}
+	if _, given := s.ModelPrices[providerID+"/"+model]; given {
+		return "ignored"
+	}
+	if _, given := s.ModelPrices[providerID+"/*"]; given {
+		return "ignored"
+	}
+	return ""
+}
+
+// modelPrices lists what the user has said models cost, and which provider
+// and model each is for.
+func modelPrices() error {
+	prices := settings.Load().ModelPrices
+	if len(prices) == 0 {
+		fmt.Println(muted.Render("no model is priced by you yet"))
+		fmt.Println(faint.Render("magpie model price <provider/model> <in>,<out>,<cache read>,<cache write>"))
+		return nil
+	}
+	for _, id := range slices.Sorted(maps.Keys(prices)) {
+		p, bad := prices[id].Price()
+		if bad != "" {
+			fmt.Println(bold.Render(id), muted.Render("· no "+bad+" price given, and ignored"))
+			continue
+		}
+		fmt.Println(bold.Render(id), muted.Render("· "+perMillion(p)+
+			fmt.Sprintf(" · cache %.4g/%.4g", p.CacheRead, p.CacheWrite)))
 	}
 	return nil
 }

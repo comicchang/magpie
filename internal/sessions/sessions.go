@@ -3,7 +3,7 @@
 // Codex's rollout files, OpenCode's database (or its older JSON files) and
 // ZCode's, Pi's session files, DeepSeek Harness's, Cline's, Grok Build's and
 // WorkBuddy's — with the
-// tokens each spent, what that cost at list price, and the command that
+// tokens each spent, what that cost at the effective price, and the command that
 // resumes it. It only ever reads the agents' folders.
 //
 // The files grow long (hundreds of MB), so each one's parse is kept by path,
@@ -75,13 +75,13 @@ type Session struct {
 	Last   time.Time `json:"last"`
 	Models []Model   `json:"models"`
 	Tokens
-	Cost     float64 `json:"cost"`     // USD at list price, for the priced models
+	Cost     float64 `json:"cost"`     // USD at the effective price, for the priced models
 	Unpriced int     `json:"unpriced"` // models that spent tokens but have no known price
 	Resume   string  `json:"resume"`   // the command that picks the session up again
 	Path     string  `json:"path"`     // its (main) file
 }
 
-// PriceOf is the list price of a model as a session names it. Tests swap it.
+// PriceOf is the effective price of a model as a session names it. Tests swap it.
 var PriceOf = priceOf
 
 // Limit is how many sessions, the latest by last activity, List reads.
@@ -942,23 +942,18 @@ func title(s string) string {
 var dated = regexp.MustCompile(`-\d{8}$`)
 
 // priceOf prices a model as a session names it: one through magpie as
-// "<provider>/<model>" at the price the gateway counts it at, else the bare
-// id at its maker's list price on models.dev.
+// "<provider>/<model>" at the price the gateway counts it at — what the user
+// set for that provider and model, else that provider's own list price, else
+// its maker's on models.dev — and a bare id only ever at its maker's, which is
+// a different question from what one provider charges.
 func priceOf(model string) (catalog.Price, bool) {
 	m := strings.TrimSpace(model)
 	if m == "" {
 		return catalog.Price{}, false
 	}
 	if pid, rest, ok := strings.Cut(m, "/"); ok {
-		for _, p := range provider.All() {
-			if p.ID == pid {
-				for _, c := range p.Catalogs() {
-					if pr, ok := catalog.PriceOf(c, rest); ok {
-						return pr, true
-					}
-				}
-				break
-			}
+		if pr, ok := provider.EffectivePrice(pid, rest); ok {
+			return pr, true
 		}
 	}
 	bare := strings.ToLower(m[strings.LastIndexByte(m, '/')+1:])
