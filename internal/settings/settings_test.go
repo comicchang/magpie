@@ -1,8 +1,11 @@
 package settings
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -176,5 +179,177 @@ func TestArrange(t *testing.T) {
 	s.Theme = "dark"
 	if Save(s) != nil || len(Load().AgentsHidden) != 1 {
 		t.Fatal("arrangement lost")
+	}
+}
+
+// setPerModel puts key, with a value of each field's own type, into every
+// per-model map of s and returns the fields it did so in. The convention is
+// as the settings state it, written out here: a field named Model* whose
+// type is a map[string]X.
+func setPerModel(t *testing.T, s *Settings, key string) []string {
+	t.Helper()
+	v := reflect.ValueOf(s).Elem()
+	var names []string
+	for i := range v.NumField() {
+		f := v.Type().Field(i)
+		if !strings.HasPrefix(f.Name, "Model") || f.Type.Kind() != reflect.Map || f.Type.Key().Kind() != reflect.String {
+			continue
+		}
+		given := reflect.New(f.Type.Elem()).Elem()
+		switch given.Kind() {
+		case reflect.String:
+			given.SetString("given")
+		case reflect.Bool:
+			given.SetBool(true)
+		case reflect.Slice:
+			given.Set(reflect.MakeSlice(given.Type(), 1, 1))
+		}
+		m := reflect.MakeMap(f.Type)
+		m.SetMapIndex(reflect.ValueOf(key), given)
+		v.Field(i).Set(m)
+		names = append(names, f.Name)
+	}
+	if len(names) == 0 {
+		t.Fatal("the settings hold no per-model map")
+	}
+	return names
+}
+
+// A field is per-model for the name and the type and nothing else: the walk
+// takes the settings' own word for it, so a field that is not a map is left
+// out however it is named, and a field that is one is walked even when its
+// keys are not a model's. That is the whole rule on purpose — a map added to
+// the settings later is carried and renamed by it without being told of
+// anywhere else — and it is why a field keyed by something other than a
+// model is not named Model*.
+func TestPerModelRule(t *testing.T) {
+	type pages struct {
+		ModelNames map[string]string   // per-model
+		ModelBits  map[int]string      // named as one, but not of strings to X
+		ModelCount map[string]int      // a map of strings to X, though not of models
+		Visible    map[string][]string // by agent id
+		Theme      string
+	}
+	var got []string
+	for _, f := range perModelFields(reflect.TypeFor[pages]()) {
+		got = append(got, f.Name)
+	}
+	if strings.Join(got, ",") != "ModelNames,ModelCount" {
+		t.Fatalf("walked %v, want ModelNames and ModelCount only", got)
+	}
+}
+
+// Every per-model map of the settings is walked, and nothing else: each one
+// the walk reaches is marked with a key, and the marks are read back against
+// the fields they are on.
+func TestPerModelKeysWalkEveryPerModelMap(t *testing.T) {
+	s := Settings{Visible: map[string][]string{"code": {"openai/gpt-5-mini"}}}
+	names := setPerModel(t, &s, "openai/gpt-5-mini")
+	PerModelKeys(&s, func(m reflect.Value) {
+		m.SetMapIndex(reflect.ValueOf("walked"), reflect.New(m.Type().Elem()).Elem())
+	})
+	v := reflect.ValueOf(&s).Elem()
+	for i := range v.NumField() {
+		f := v.Type().Field(i)
+		if f.Type.Kind() != reflect.Map {
+			continue
+		}
+		if walked := v.Field(i).MapIndex(reflect.ValueOf("walked")).IsValid(); walked != slices.Contains(names, f.Name) {
+			t.Errorf("%s walked = %v, want %v", f.Name, walked, slices.Contains(names, f.Name))
+		}
+	}
+}
+
+// Carrying puts cur's per-model maps into in's whole, whichever page wrote
+// them, and leaves everything else as the request body had it.
+func TestCarryPerModel(t *testing.T) {
+	var cur, in Settings
+	names := setPerModel(t, &cur, "openai/gpt-5-mini")
+	in.Theme, in.Visible = "light", map[string][]string{"code": {"openai/gpt-5-mini"}}
+	CarryPerModel(&in, &cur)
+	c, i := reflect.ValueOf(&cur).Elem(), reflect.ValueOf(&in).Elem()
+	for _, name := range names {
+		if !reflect.DeepEqual(i.FieldByName(name).Interface(), c.FieldByName(name).Interface()) {
+			t.Errorf("%s not carried over: %v", name, i.FieldByName(name).Interface())
+		}
+	}
+	if in.Theme != "light" || !reflect.DeepEqual(in.Visible, map[string][]string{"code": {"openai/gpt-5-mini"}}) {
+		t.Fatalf("carried what is not per-model: %+v", in)
+	}
+}
+
+// The Settings page sends only its own choices, and the save keeps what the
+// pages beside it set: the per-model maps whole as they were (gui/api.go's
+// POST /api/settings), so a change of theme no longer loses the names, the
+// levels and the image answers the user gave their models.
+func TestSettingsPageSaveKeepsWhatOtherPagesSet(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	var want Settings
+	names := setPerModel(t, &want, "openai/gpt-5-mini")
+	want.Visible = map[string][]string{"code": {"openai/gpt-5-mini"}}
+	want.LANKey, want.TextSize = "magpie-lan", 125
+	if err := Save(want); err != nil {
+		t.Fatal(err)
+	}
+
+	// the request body: the theme, and nothing of what another page set
+	var in Settings
+	if err := json.Unmarshal([]byte(`{"theme":"light"}`), &in); err != nil {
+		t.Fatal(err)
+	}
+	cur := Load()
+	in.AgentOrder, in.AgentsHidden, in.AgentsShown = cur.AgentOrder, cur.AgentsHidden, cur.AgentsShown
+	in.Window = cur.Window
+	in.Visible = cur.Visible
+	CarryPerModel(&in, &cur)
+	in.LAN, in.LANKey = cur.LAN, cur.LANKey
+	in.RedactRules = cur.RedactRules
+	in.QuotaLeft = cur.QuotaLeft
+	in.TextSize = cur.TextSize
+	if err := Save(in); err != nil {
+		t.Fatal(err)
+	}
+
+	// every per-model map there are, the three there are now and any added
+	// later: what the user said of their models is all of them, and none of
+	// it is this page's to send
+	got := Load()
+	if got.Theme != "light" {
+		t.Fatalf("the page's own choice not saved: %+v", got)
+	}
+	for _, name := range names {
+		g, w := reflect.ValueOf(got).FieldByName(name), reflect.ValueOf(want).FieldByName(name)
+		if !reflect.DeepEqual(g.Interface(), w.Interface()) {
+			t.Errorf("%s was lost: %v", name, g.Interface())
+		}
+	}
+	if !reflect.DeepEqual(got.Visible, want.Visible) || got.LANKey != want.LANKey || got.TextSize != want.TextSize {
+		t.Fatalf("the rest of what other pages keep was lost: %+v", got)
+	}
+}
+
+// Renaming a provider moves what was said of its models in every per-model
+// map, all of them and not only the ones before one that moved something,
+// and leaves keys that are not a model's of it as they were.
+func TestRenamePerModel(t *testing.T) {
+	var s Settings
+	names := setPerModel(t, &s, "old/model")
+	s.ModelNames["older/model"] = "a provider whose id begins the same"
+	s.ModelNames["old"] = "not a model of old either"
+	if !s.RenamePerModel("old", "new") {
+		t.Fatal("renaming moved nothing")
+	}
+	v := reflect.ValueOf(&s).Elem()
+	for _, name := range names {
+		m := v.FieldByName(name)
+		if !m.MapIndex(reflect.ValueOf("new/model")).IsValid() || m.MapIndex(reflect.ValueOf("old/model")).IsValid() {
+			t.Errorf("%s holds %v", name, m.Interface())
+		}
+	}
+	if s.ModelNames["older/model"] == "" || s.ModelNames["old"] == "" {
+		t.Fatalf("a key that is not a model of old was moved: %v", s.ModelNames)
+	}
+	if s.RenamePerModel("old", "new") {
+		t.Error("renaming again moved something")
 	}
 }
