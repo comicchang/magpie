@@ -38,6 +38,10 @@ type Server struct {
 	URL       string            `json:"url,omitempty"`
 	Headers   map[string]string `json:"headers,omitempty"`
 	Agents    []string          `json:"agents"`
+	// Timeout is the seconds an agent gives one of the server's tools
+	// before it gives up; 0 is the agent's own (the timeout it has for any
+	// server). Each agent's format says it its own way (encode).
+	Timeout int `json:"timeout,omitempty"`
 	// DisabledTools are the server's tools its agents leave out, by the
 	// names the server gives them, written in each agent's own way where
 	// it has one (mcp_tools_off.go)
@@ -127,6 +131,9 @@ func (s *Server) check() error {
 			delete(s.Headers, k)
 		}
 	}
+	if s.Timeout < 0 {
+		return fmt.Errorf("%s: the timeout is seconds, 0 for the agent's own", s.Name)
+	}
 	return nil
 }
 
@@ -134,7 +141,7 @@ func (s *Server) check() error {
 // have it doesn't matter.
 func (s *Server) same(o *Server) bool {
 	return s.Transport == o.Transport && s.Command == o.Command && slices.Equal(s.Args, o.Args) &&
-		maps.Equal(s.Env, o.Env) && s.URL == o.URL && maps.Equal(s.Headers, o.Headers)
+		maps.Equal(s.Env, o.Env) && s.URL == o.URL && maps.Equal(s.Headers, o.Headers) && s.Timeout == o.Timeout
 }
 
 // ---- each agent's own format ----------------------------------------------
@@ -345,6 +352,58 @@ func selfTimeout(s *Server, def int) int {
 	return def
 }
 
+// timeoutOf is the seconds an agent waits for a tool of s: the Timeout the
+// library gives the server, else what selfTimeout gives it, else def.
+func timeoutOf(s *Server, def int) int {
+	if s.Timeout > 0 {
+		return s.Timeout
+	}
+	return selfTimeout(s, def)
+}
+
+// timeoutFrom is the Timeout an entry says in its own format: the inverse
+// of what encode writes for it. Goose's 300 is the default magpie gives
+// every Goose server, not one the library set, so it reads as 0.
+func timeoutFrom(name string, f mcpFormat, m map[string]any) int {
+	var secs int64
+	switch f {
+	case fmtOmp:
+		if ms, ok := numberOf(m["timeout"]); ok && ms > 0 && ms%1000 == 0 {
+			secs = ms / 1000
+		}
+	case fmtCodex:
+		secs, _ = numberOf(m["tool_timeout_sec"])
+	case fmtGoose:
+		if t, ok := numberOf(m["timeout"]); ok && t != gooseOldTimeout {
+			secs = t
+		}
+	}
+	// magpie-image's own default is magpie's, not the library's: the value
+	// selfTimeout gives it, read back as the default it is
+	if name == selfServerName && int(secs) == int(imagemcp.ToolTimeout().Seconds()) {
+		return 0
+	}
+	if secs <= 0 {
+		return 0
+	}
+	return int(secs)
+}
+
+// numberOf is a JSON or TOML number as an int64, false for anything else.
+func numberOf(v any) (int64, bool) {
+	switch x := v.(type) {
+	case int:
+		return int64(x), true
+	case int64:
+		return x, true
+	case uint64:
+		return int64(x), true
+	case float64:
+		return int64(x), true
+	}
+	return 0, false
+}
+
 // gooseOldTimeout is the timeout magpie wrote for every Goose server before
 // magpie-image was given a longer one.
 const gooseOldTimeout = 300
@@ -483,7 +542,7 @@ func (f *mcpFile) encode(s *Server) ordered {
 				add("env_keys", pass)
 			}
 		}
-		add("timeout", selfTimeout(s, 300))
+		add("timeout", timeoutOf(s, 300))
 	case fmtPi:
 		// pi-mcp-extension reads the transport from "transport",
 		// pi-mcp-adapter from "httpTransport"; each ignores the other's
@@ -537,6 +596,11 @@ func (f *mcpFile) encode(s *Server) ordered {
 			add("command", s.Command)
 			add("args", list(s.Args))
 			optional("env", s.Env)
+		}
+		// omp's timeout is milliseconds (discovery/mcp-json.ts); left out
+		// for its own 30 seconds
+		if s.Timeout > 0 {
+			add("timeout", s.Timeout*1000)
 		}
 	case fmtKimi, fmtDevin:
 		// as `kimi mcp add` and `devin mcp add` write them; Kimi's
@@ -628,7 +692,7 @@ func (f *mcpFile) encode(s *Server) ordered {
 			}
 		}
 		// Codex gives a tool a minute unless its entry says more
-		if t := selfTimeout(s, 0); t > 0 {
+		if t := timeoutOf(s, 0); t > 0 {
 			add("tool_timeout_sec", t)
 		}
 	case fmtDsh:
@@ -845,6 +909,7 @@ func (f *mcpFile) decode(name string, m map[string]any) (*Server, bool) {
 	if len(s.Args) == 0 {
 		s.Args = nil
 	}
+	s.Timeout = timeoutFrom(name, f.Format, m)
 	r := f.refsOf()
 	s.Headers, s.Env = mapFrom(r.headers, s.Headers), mapFrom(r.env, s.Env)
 	if s.Transport == "" || (s.Transport == "stdio" && s.Command == "") || (s.Remote() && s.URL == "") {
@@ -1046,10 +1111,21 @@ var owned = map[mcpFormat][]string{
 // one there (refKeys): an env_vars or env_keys the user gave a server
 // whose library entry has none stays theirs.
 func (f *mcpFile) mine(s *Server) []string {
-	if extra := f.refKeys(s); len(extra) > 0 {
-		return append(slices.Clone(owned[f.Format]), extra...)
+	keys := owned[f.Format]
+	// a timeout the library gives the server is magpie's over the user's
+	// old one; without one, the user's timeout stays as it is
+	if s.Timeout > 0 {
+		switch f.Format {
+		case fmtOmp, fmtGoose:
+			keys = append(slices.Clone(keys), "timeout")
+		case fmtCodex:
+			keys = append(slices.Clone(keys), "tool_timeout_sec")
+		}
 	}
-	return owned[f.Format]
+	if extra := f.refKeys(s); len(extra) > 0 {
+		return append(slices.Clone(keys), extra...)
+	}
+	return keys
 }
 
 // current is the agent's entry read as the server, for comparing with s:
@@ -1057,6 +1133,11 @@ func (f *mcpFile) mine(s *Server) []string {
 // keys that are the user's rather than magpie's (mine).
 func (f *mcpFile) current(name string, m map[string]any, s *Server) (*Server, bool) {
 	cur, ok := f.decode(name, m)
+	// a timeout the library doesn't give the server is the user's, which
+	// magpie leaves alone: it isn't a difference from the library's 0
+	if cur != nil && s.Timeout == 0 {
+		cur.Timeout = 0
+	}
 	if !ok || cur == nil || len(f.refKeys(s)) > 0 {
 		return cur, ok
 	}

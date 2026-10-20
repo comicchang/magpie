@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 
 	"golang.org/x/term"
@@ -88,12 +89,24 @@ func libraryCmd(args []string) error {
 		switch {
 		case len(rest) >= 3 && rest[0] == "add":
 			var cmd, agents []string
+			env, headers := map[string]string{}, map[string]string{}
+			timeout := 0
 			for _, a := range rest[2:] {
-				if v, ok := strings.CutPrefix(a, "agents="); ok {
-					if agents, err = libraryAgents(v, "mcp"); err != nil {
+				k, v, kv := strings.Cut(a, "=")
+				switch ek, ev, isEnv := strings.Cut(v, "="); {
+				case strings.HasPrefix(a, "agents="):
+					if agents, err = libraryAgents(strings.TrimPrefix(a, "agents="), "mcp"); err != nil {
 						return err
 					}
-				} else {
+				case kv && k == "env" && isEnv:
+					env[ek] = ev
+				case kv && k == "header" && isEnv:
+					headers[ek] = ev
+				case kv && k == "timeout":
+					if timeout, err = strconv.Atoi(v); err != nil || timeout < 0 {
+						return fmt.Errorf("timeout=%s: the timeout is whole seconds, 0 for the agent's own", v)
+					}
+				default:
 					cmd = append(cmd, a)
 				}
 			}
@@ -101,6 +114,13 @@ func libraryCmd(args []string) error {
 			if s, err = library.ServerOf(rest[1], cmd); err != nil {
 				return err
 			}
+			if len(env) > 0 {
+				s.Env = env
+			}
+			if len(headers) > 0 {
+				s.Headers = headers
+			}
+			s.Timeout = timeout
 			if agents != nil {
 				s.Agents = agents
 			}
