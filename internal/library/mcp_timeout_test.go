@@ -3,6 +3,7 @@ package library
 import (
 	"encoding/json"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -109,6 +110,7 @@ func TestNegativeTimeoutIsRefused(t *testing.T) {
 func TestSaveServerKeepsTimeoutInTheAgentFile(t *testing.T) {
 	h := sandbox(t)
 	p := filepath.Join(h, ".omp", "agent", "mcp.json")
+	holdCLI(t, h, "omp") // omp with its MCP file alone is gone (#2177), so unwritten
 	ok(t)(SaveServer("", Server{Name: "fs", Transport: "stdio", Command: "npx", Timeout: 45, Agents: []string{"omp"}}))
 	var file struct {
 		MCPServers map[string]map[string]any `json:"mcpServers"`
@@ -128,4 +130,157 @@ func valueMap(o ordered) map[string]any {
 		m[e.k] = e.v
 	}
 	return m
+}
+
+// Gemini's timeout is milliseconds and Hermes' is seconds, and both
+// round-trip; Hermes' connect_timeout is its startup one, not the request
+// timeout. Alma is not verified to read a timeout, so none is written.
+func TestGeminiAndHermesTimeoutsRoundTrip(t *testing.T) {
+	s := &Server{Name: "fs", Transport: "stdio", Command: "npx", Timeout: 45}
+	gem := &mcpFile{Format: fmtGemini}
+	if v, ok := valueOf(gem.encode(s), "timeout"); !ok || v != 45000 {
+		t.Fatalf("gemini timeout = %v %v, want 45000 ms", v, ok)
+	}
+	if back, _ := gem.decode("fs", map[string]any{"command": "npx", "timeout": float64(45000)}); back.Timeout != 45 {
+		t.Errorf("gemini read back %d, want 45", back.Timeout)
+	}
+	hermes := &mcpFile{Format: fmtHermes}
+	if v, ok := valueOf(hermes.encode(s), "timeout"); !ok || v != 45 {
+		t.Fatalf("hermes timeout = %v %v, want 45 seconds", v, ok)
+	}
+	if back, _ := hermes.decode("fs", map[string]any{"command": "npx", "timeout": float64(45), "connect_timeout": float64(60)}); back.Timeout != 45 {
+		t.Errorf("hermes read back %d, want 45", back.Timeout)
+	}
+	if _, ok := valueOf((&mcpFile{Format: fmtAlma}).encode(s), "timeout"); ok {
+		t.Error("alma wrote a timeout it isn't verified to read")
+	}
+}
+
+// a format with no timeout key (OpenCode's timeout is for fetching tools, not
+// calls) writes none, and compares as the same server, so the entry isn't
+// rewritten on every sync
+func TestTimeoutAnAgentCannotTakeIsNotCompared(t *testing.T) {
+	oc := &mcpFile{Format: fmtOpenCode}
+	s := &Server{Name: "fs", Transport: "stdio", Command: "npx", Timeout: 60}
+	if oc.carriesTimeout() {
+		t.Fatal("opencode is said to carry a timeout")
+	}
+	if _, ok := valueOf(oc.encode(s), "timeout"); ok {
+		t.Error("opencode wrote a timeout")
+	}
+	m := map[string]any{"type": "local", "command": []any{"npx"}}
+	if cur, _ := oc.current("fs", m, s); !cur.same(s) {
+		t.Error("an agent that can't take a timeout compares as out of sync")
+	}
+}
+
+// a timeout an agent's format can't take is reported by the sync that gives
+// it the server; the server is still written to it
+func TestTimeoutAnAgentCannotTakeIsReported(t *testing.T) {
+	sandbox(t)
+	// the report is a problem, not an error: the save itself succeeds
+	res, err := SaveServer("", Server{Name: "fs", Transport: "stdio", Command: "npx", Timeout: 60, Agents: []string{"opencode"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range res.Problems {
+		if p.Agent == "opencode" && p.What == "mcp:fs" && strings.Contains(p.Error, "60 seconds") {
+			return
+		}
+	}
+	t.Fatalf("the 60 seconds opencode can't take weren't reported: %+v", res.Problems)
+}
+
+// serverTimeout is the timeout of the named server in an agent's JSON file
+// (mcpServers), nil when it has none.
+func serverTimeout(t *testing.T, path, name string) any {
+	t.Helper()
+	var file struct {
+		MCPServers map[string]map[string]any `json:"mcpServers"`
+	}
+	if err := json.Unmarshal([]byte(read(t, path)), &file); err != nil {
+		t.Fatalf("%s is not JSON: %v", path, err)
+	}
+	return file.MCPServers[name]["timeout"]
+}
+
+// a save that sends no timeout (the GUI's form has none) keeps the server's
+// through an edit, a rename and a new agent given it; an explicit 0 resets it
+func TestSaveWithoutTimeoutKeepsIt(t *testing.T) {
+	h := sandbox(t)
+	ompFile := filepath.Join(h, ".omp", "agent", "mcp.json")
+	gemFile := filepath.Join(h, ".gemini", "settings.json")
+	holdCLI(t, h, "omp") // omp with its MCP file alone is gone (#2177), so unwritten
+	ok(t)(SaveServer("", Server{Name: "fs", Transport: "stdio", Command: "npx", Timeout: 60, Agents: []string{"omp"}}))
+	ok(t)(SaveServerKeepTimeout("fs", Server{Name: "fs", Transport: "stdio", Command: "npx", Agents: []string{"omp"}}))
+	ok(t)(SaveServerKeepTimeout("fs", Server{Name: "fs2", Transport: "stdio", Command: "npx", Agents: []string{"omp"}}))
+	ok(t)(ServerAgents("fs2", []string{"omp", "gemini"}))
+	l, err := load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s := l.server("fs2"); s == nil || s.Timeout != 60 {
+		t.Fatalf("the library's fs2 = %+v, want its 60 seconds kept", s)
+	}
+	if got := serverTimeout(t, ompFile, "fs2"); got != float64(60000) {
+		t.Fatalf("omp's fs2 timeout = %v, want 60000 ms", got)
+	}
+	if got := serverTimeout(t, gemFile, "fs2"); got != float64(60000) {
+		t.Fatalf("gemini's fs2 timeout = %v, want 60000 ms", got)
+	}
+	ok(t)(SaveServer("fs2", Server{Name: "fs2", Transport: "stdio", Command: "npx", Agents: []string{"omp"}}))
+	if l, err = load(); err != nil {
+		t.Fatal(err)
+	}
+	if s := l.server("fs2"); s == nil || s.Timeout != 0 {
+		t.Fatalf("an explicit 0 didn't reset fs2: %+v", s)
+	}
+	// the reset leaves omp's file JSON; the 60000 magpie wrote stays in its
+	// entry, as an unset timeout leaves what the agent's file has
+	serverTimeout(t, ompFile, "fs2")
+}
+
+// the request timeout is the library's to set; a startup timeout the user set
+// (Codex's startup_timeout_sec, Hermes' connect_timeout) is theirs. A library
+// timeout replaces only the request one, and an unset one leaves both.
+func TestTimeoutMatrixKeepsStartupTimeouts(t *testing.T) {
+	cases := []struct {
+		name    string
+		format  mcpFormat
+		req     string
+		unit    int // the request key's value for one second
+		startup string
+	}{
+		{"omp", fmtOmp, "timeout", 1000, ""},
+		{"gemini", fmtGemini, "timeout", 1000, ""},
+		{"hermes", fmtHermes, "timeout", 1, "connect_timeout"},
+		{"codex", fmtCodex, "tool_timeout_sec", 1, "startup_timeout_sec"},
+		{"goose", fmtGoose, "timeout", 1, ""},
+	}
+	for _, c := range cases {
+		f := &mcpFile{Format: c.format}
+		old := map[string]any{c.req: float64(30 * c.unit)}
+		if c.startup != "" {
+			old[c.startup] = float64(20)
+		}
+		set := &Server{Name: "x", Transport: "stdio", Command: "x", Timeout: 90}
+		merged := f.merged(set, old)
+		if v, _ := valueOf(merged, c.req); v != 90*c.unit {
+			t.Errorf("%s: request timeout = %v, want %d", c.name, v, 90*c.unit)
+		}
+		if c.startup != "" {
+			if v, _ := valueOf(merged, c.startup); v != float64(20) {
+				t.Errorf("%s: the user's startup timeout came out %v, want 20", c.name, v)
+			}
+		}
+		if back, ok := f.decode("x", valueMap(merged)); !ok || back.Timeout != 90 {
+			t.Errorf("%s: read back %+v, want a request timeout of 90", c.name, back)
+		}
+		unset := &Server{Name: "x", Transport: "stdio", Command: "x"}
+		if c.startup != "" {
+			if v, _ := valueOf(f.merged(unset, old), c.startup); v != float64(20) {
+				t.Errorf("%s: an unset library timeout lost the startup one: %v", c.name, v)
+			}
+		}
+	}
 }

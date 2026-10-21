@@ -377,6 +377,13 @@ func timeoutFrom(name string, f mcpFormat, m map[string]any) int {
 		if t, ok := numberOf(m["timeout"]); ok && t != gooseOldTimeout {
 			secs = t
 		}
+	case fmtGemini:
+		// gemini-cli's timeout is milliseconds on the entry, written ×1000
+		if ms, ok := numberOf(m["timeout"]); ok && ms > 0 && ms%1000 == 0 {
+			secs = ms / 1000
+		}
+	case fmtHermes:
+		secs, _ = numberOf(m["timeout"])
 	}
 	// magpie-image's own default is magpie's, not the library's: the value
 	// selfTimeout gives it, read back as the default it is
@@ -387,6 +394,17 @@ func timeoutFrom(name string, f mcpFormat, m map[string]any) int {
 		return 0
 	}
 	return int(secs)
+}
+
+// carriesTimeout says whether an agent's format has a key the library's
+// Timeout is written to (encode, mine); a timeout it gives a server that
+// the format can't take is reported by sync, not written
+func (f *mcpFile) carriesTimeout() bool {
+	switch f.Format {
+	case fmtOmp, fmtCodex, fmtGoose, fmtGemini, fmtHermes:
+		return true
+	}
+	return false
 }
 
 // numberOf is a JSON or TOML number as an int64, false for anything else.
@@ -402,6 +420,23 @@ func numberOf(v any) (int64, bool) {
 		return int64(x), true
 	}
 	return 0, false
+}
+
+// sameNumber says whether a and b are the same whole number: numberOf
+// truncates a float, so a fraction (120.5) is told apart from 120 here.
+func sameNumber(a, b any) bool {
+	x, okA := numberOf(a)
+	y, okB := numberOf(b)
+	if !okA || !okB || x != y {
+		return false
+	}
+	if f, isF := a.(float64); isF && f != float64(x) {
+		return false
+	}
+	if f, isF := b.(float64); isF && f != float64(y) {
+		return false
+	}
+	return true
 }
 
 // gooseOldTimeout is the timeout magpie wrote for every Goose server before
@@ -477,6 +512,11 @@ func (f *mcpFile) encode(s *Server) ordered {
 			add("command", s.Command)
 			add("args", list(s.Args))
 			optional("env", s.Env)
+		}
+		// gemini-cli's timeout is milliseconds on the entry (its docs'
+		// mcpServers.timeout), so a library timeout is written ×1000
+		if s.Timeout > 0 {
+			add("timeout", s.Timeout*1000)
 		}
 	case fmtOpenCode:
 		if s.Remote() {
@@ -586,6 +626,11 @@ func (f *mcpFile) encode(s *Server) ordered {
 			add("command", s.Command)
 			add("args", list(s.Args))
 			optional("env", s.Env)
+		}
+		// Hermes' timeout is the seconds a tool call may take; connect_timeout
+		// is its startup one, which stays the user's
+		if f.Format == fmtHermes && s.Timeout > 0 {
+			add("timeout", s.Timeout)
 		}
 	case fmtOmp:
 		if s.Remote() {
@@ -1088,7 +1133,7 @@ var owned = map[mcpFormat][]string{
 	fmtPiNative: {"type", "transport", "httpTransport", "url", "headers", "command", "args", "env"},
 	fmtZCode:    {"type", "url", "headers", "command", "args", "env"},
 	fmtDsh:      {"serverName", "transport", "url", "headers", "command", "args", "env"},
-	// timeout, enabled, tools, sampling, auth… are the user's
+	// enabled, tools, sampling, auth… are the user's; so is the timeout, unless the library gives one
 	fmtHermes: {"transport", "url", "headers", "command", "args", "env"},
 	fmtAlma:   {"transport", "url", "headers", "command", "args", "env"},
 	fmtOmp:    {"type", "url", "headers", "command", "args", "env"},
@@ -1116,7 +1161,7 @@ func (f *mcpFile) mine(s *Server) []string {
 	// old one; without one, the user's timeout stays as it is
 	if s.Timeout > 0 {
 		switch f.Format {
-		case fmtOmp, fmtGoose:
+		case fmtOmp, fmtGoose, fmtGemini, fmtHermes:
 			keys = append(slices.Clone(keys), "timeout")
 		case fmtCodex:
 			keys = append(slices.Clone(keys), "tool_timeout_sec")
@@ -1137,6 +1182,11 @@ func (f *mcpFile) current(name string, m map[string]any, s *Server) (*Server, bo
 	// magpie leaves alone: it isn't a difference from the library's 0
 	if cur != nil && s.Timeout == 0 {
 		cur.Timeout = 0
+	}
+	// a format with no timeout key reads back none, so the one the library
+	// gives its server is no difference it could show
+	if cur != nil && !f.carriesTimeout() {
+		cur.Timeout = s.Timeout
 	}
 	if !ok || cur == nil || len(f.refKeys(s)) > 0 {
 		return cur, ok
@@ -1186,6 +1236,11 @@ func (f *mcpFile) merged(s *Server, old map[string]any) ordered {
 			if want, _ := e.v.([]string); slices.Equal(slices.Sorted(slices.Values(codexEnvVars(v))), want) {
 				o[i].v = v
 			}
+		}
+		// a Codex tool timeout the user already has as the same number keeps
+		// their spelling (120.0 stays 120.0, not 120)
+		if v, ok := old[e.k]; ok && f.Format == fmtCodex && e.k == "tool_timeout_sec" && sameNumber(v, e.v) {
+			o[i].v = v
 		}
 	}
 	keys := slices.Sorted(maps.Keys(old))

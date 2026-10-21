@@ -226,6 +226,11 @@ func (l *Library) syncMCP(t *Target, b *backups, res *Result) {
 			res.fail(id, "mcp:"+s.Name, err)
 			continue
 		}
+		// a timeout the agent's format has no key for is reported, and the
+		// server written without it
+		if s.Timeout > 0 && !t.MCP.carriesTimeout() {
+			res.fail(id, "mcp:"+s.Name, fmt.Errorf("%s has no timeout for an MCP server's tools, so its %d seconds aren't written", t.Agent.Name, s.Timeout))
+		}
 		s, _ = t.MCP.side(s)
 		old := entries[s.Name]
 		if err := t.MCP.foreign(old); err != nil {
@@ -544,6 +549,18 @@ func readView(problems []Problem, glance bool) (*View, error) {
 
 // SaveServer adds a server, or replaces the one called old (renaming it).
 func SaveServer(old string, s Server) (*Result, error) {
+	return saveServer(old, s, false)
+}
+
+// SaveServerKeepTimeout is SaveServer for a save that sends no timeout (the
+// page has none to send): the server keeps the timeout it has under old,
+// where SaveServer takes the Timeout it's given, 0 resetting it to the
+// agent's own.
+func SaveServerKeepTimeout(old string, s Server) (*Result, error) {
+	return saveServer(old, s, true)
+}
+
+func saveServer(old string, s Server, keepTimeout bool) (*Result, error) {
 	if err := s.check(); err != nil {
 		return nil, err
 	}
@@ -566,6 +583,10 @@ func SaveServer(old string, s Server) (*Result, error) {
 			// the tools turned off stay, the editor not sending them
 			if s.DisabledTools == nil {
 				s.DisabledTools = l.MCP[i].DisabledTools
+			}
+			// a save that sends no timeout keeps the one the server has
+			if keepTimeout {
+				s.Timeout = l.MCP[i].Timeout
 			}
 			l.MCP = slices.Delete(l.MCP, i, i+1)
 			if old != s.Name {

@@ -548,7 +548,17 @@ authorization_server_issuer = "https://id.example"
 			s.Args = append(slices.Clone(s.Args), "--more")
 		}
 		s.Agents = []string{"claude", "codex"}
-		ok(t)(SaveServer(name, s))
+		// claude takes no timeout, so its one is reported, not written; the
+		// codex keys under test are still written
+		res, err := SaveServer(name, s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, p := range res.Problems {
+			if !strings.Contains(p.Error, "has no timeout") {
+				t.Fatalf("problems: %+v", res.Problems)
+			}
+		}
 	}
 	after, err := f.entries()
 	if err != nil {

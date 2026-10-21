@@ -3,6 +3,7 @@ package gui
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -448,12 +449,15 @@ func libraryRoutes(mux *http.ServeMux, w Windows) {
 			Replace bool
 			library.InstructionsChange
 		}
-		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		body, err := io.ReadAll(r.Body)
+		if err == nil {
+			err = json.Unmarshal(body, &in)
+		}
+		if err != nil {
 			fail(rw, err)
 			return
 		}
 		var res *library.Result
-		var err error
 		switch r.PathValue("what") + "/" + r.PathValue("action") {
 		case "instructions/save":
 			c := in.InstructionsChange
@@ -462,7 +466,15 @@ func libraryRoutes(mux *http.ServeMux, w Windows) {
 		case "instructions/import":
 			res, err = library.ImportInstructions(in.Name)
 		case "servers/save":
-			res, err = library.SaveServer(in.Old, in.Server)
+			// the page's server form has no timeout, so a save without one
+			// keeps the one the server has; a timeout sent, 0 included, is set
+			var sent struct{ Server map[string]json.RawMessage }
+			_ = json.Unmarshal(body, &sent)
+			if _, ok := sent.Server["timeout"]; ok {
+				res, err = library.SaveServer(in.Old, in.Server)
+			} else {
+				res, err = library.SaveServerKeepTimeout(in.Old, in.Server)
+			}
 		case "servers/agents":
 			res, err = library.ServerAgents(in.Name, in.Agents)
 		case "servers/tools":
