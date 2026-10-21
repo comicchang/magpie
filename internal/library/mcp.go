@@ -1155,11 +1155,12 @@ var owned = map[mcpFormat][]string{
 // and Goose's that name a variable are magpie's only while s references
 // one there (refKeys): an env_vars or env_keys the user gave a server
 // whose library entry has none stays theirs.
-func (f *mcpFile) mine(s *Server) []string {
+func (f *mcpFile) mine(s *Server, reset bool) []string {
 	keys := owned[f.Format]
 	// a timeout the library gives the server is magpie's over the user's
-	// old one; without one, the user's timeout stays as it is
-	if s.Timeout > 0 {
+	// old one; without one, the user's timeout stays as it is, unless the
+	// library has just cleared the one it gave (reset): that one was magpie's
+	if s.Timeout > 0 || reset {
 		switch f.Format {
 		case fmtOmp, fmtGoose, fmtGemini, fmtHermes:
 			keys = append(slices.Clone(keys), "timeout")
@@ -1222,8 +1223,14 @@ func (f *mcpFile) current(name string, m map[string]any, s *Server) (*Server, bo
 // one kept; a default magpie gives (Copilot's tools, Goose's timeout)
 // yields to the user's.
 func (f *mcpFile) merged(s *Server, old map[string]any) ordered {
+	return f.mergedWith(s, old, false)
+}
+
+// mergedWith is merged, with reset set when the library cleared the timeout
+// it gave s: the timeout the entry has is magpie's, so it goes.
+func (f *mcpFile) mergedWith(s *Server, old map[string]any, reset bool) ordered {
 	o := f.encode(s)
-	mine := f.mine(s)
+	mine := f.mine(s, reset)
 	behind := f.behind(s, old)
 	for i, e := range o {
 		if v, ok := old[e.k]; ok && !slices.Contains(mine, e.k) && !(behind && f.Format == fmtGoose && e.k == "timeout") {

@@ -54,6 +54,10 @@ type Library struct {
 	// kept is where a change put what it kept aside before the sync, for
 	// the sync to keep the agents' files beside it
 	kept *backups
+	// resetTimeout are the servers whose library timeout this change cleared
+	// (saveServer): the sync drops the timeout magpie wrote into the agents'
+	// entries, which the library no longer gives them
+	resetTimeout map[string]bool
 	// hashes are the library's skills' hashes as this change read them
 	// (libHash); one taken from an agent's edit is read again
 	hashes map[string]string

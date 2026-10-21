@@ -248,14 +248,16 @@ func (l *Library) syncMCP(t *Target, b *backups, res *Result) {
 			}
 			off, offMine = e, m
 		}
+		// a timeout the library cleared is still in the entry until it's written
+		reset := l.resetTimeout[s.Name]
 		if old != nil && off == nil {
-			if cur, ok := t.MCP.current(s.Name, old, s); ok && cur.same(s) && t.MCP.has(s) && !t.MCP.behind(s, old) {
+			if cur, ok := t.MCP.current(s.Name, old, s); ok && cur.same(s) && t.MCP.has(s) && !t.MCP.behind(s, old) && !reset {
 				mine = append(mine, s.Name)
 				toolsOff[s.Name] = offMine
 				continue
 			}
 		}
-		if write("mcp:"+s.Name, func() error { return t.MCP.putEntry(s, off.apply(t.MCP.merged(s, old))) }) {
+		if write("mcp:"+s.Name, func() error { return t.MCP.putEntry(s, off.apply(t.MCP.mergedWith(s, old, reset))) }) {
 			mine = append(mine, s.Name)
 			toolsOff[s.Name] = offMine
 		} else if old != nil {
@@ -587,6 +589,13 @@ func saveServer(old string, s Server, keepTimeout bool) (*Result, error) {
 			// a save that sends no timeout keeps the one the server has
 			if keepTimeout {
 				s.Timeout = l.MCP[i].Timeout
+			} else if s.Timeout == 0 && l.MCP[i].Timeout > 0 {
+				// a timeout cleared here was magpie's: the agents' entries
+				// drop it with the library's, back to their own default
+				if l.resetTimeout == nil {
+					l.resetTimeout = map[string]bool{}
+				}
+				l.resetTimeout[s.Name] = true
 			}
 			l.MCP = slices.Delete(l.MCP, i, i+1)
 			if old != s.Name {

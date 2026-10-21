@@ -176,12 +176,13 @@ func (l *Library) syncProjectMCP(p *Project, fail func(what string, err error)) 
 		}
 		for _, s := range want[rel] {
 			old := entries[s.Name]
+			reset := l.resetTimeout[s.Name]
 			if old != nil && !slices.Contains(had, s.Name) {
 				fail("mcp:"+s.Name, fmt.Errorf("%s has a server called %s already that isn't magpie's: it's left as it is", rel, s.Name))
 				continue
 			}
 			if old != nil {
-				if cur, ok := f.current(s.Name, old, s); ok && cur.same(s) && !f.behind(s, old) {
+				if cur, ok := f.current(s.Name, old, s); ok && cur.same(s) && !f.behind(s, old) && !reset {
 					mine = append(mine, s.Name)
 					continue
 				}
@@ -195,7 +196,7 @@ func (l *Library) syncProjectMCP(p *Project, fail func(what string, err error)) 
 					p.MadeFiles = append(p.MadeFiles, rel)
 				}
 			}
-			if err := f.put(s, old); err != nil {
+			if err := f.putEntry(s, f.mergedWith(s, old, reset)); err != nil {
 				fail("mcp:"+s.Name, err)
 				if old != nil {
 					mine = append(mine, s.Name)

@@ -123,6 +123,41 @@ func TestSaveServerKeepsTimeoutInTheAgentFile(t *testing.T) {
 	}
 }
 
+// an explicit 0 is the agent's own default: the timeout magpie wrote for the
+// server goes from the agent's entry with the library's, while a timeout the
+// user set in the entry, which the library never gave, stays
+func TestExplicitZeroTimeoutResetsWhatMagpieWrote(t *testing.T) {
+	h := sandbox(t)
+	p := filepath.Join(h, ".omp", "agent", "mcp.json")
+	holdCLI(t, h, "omp")
+	fs := func(timeout int) Server {
+		return Server{Name: "fs", Transport: "stdio", Command: "npx", Timeout: timeout, Agents: []string{"omp"}}
+	}
+	entry := func() map[string]any {
+		var file struct {
+			MCPServers map[string]map[string]any `json:"mcpServers"`
+		}
+		if err := json.Unmarshal([]byte(read(t, p)), &file); err != nil {
+			t.Fatalf("omp's mcp.json is not JSON: %v", err)
+		}
+		return file.MCPServers["fs"]
+	}
+	ok(t)(SaveServer("", fs(45)))
+	if got := entry()["timeout"]; got != float64(45000) {
+		t.Fatalf("omp's timeout = %v, want 45000 ms", got)
+	}
+	ok(t)(SaveServer("fs", fs(0)))
+	if got, set := entry()["timeout"]; set {
+		t.Fatalf("omp's timeout = %v after an explicit 0, want omp's own default (no timeout)", got)
+	}
+	// the user's own timeout, which the library never gave, is kept
+	write(t, p, `{"mcpServers":{"fs":{"type":"stdio","command":"npx","timeout":30000}}}`)
+	ok(t)(SaveServer("fs", fs(0)))
+	if got := entry()["timeout"]; got != float64(30000) {
+		t.Fatalf("the user's timeout = %v, want it kept at 30000", got)
+	}
+}
+
 // valueMap turns an ordered entry into a plain map, as an agent file reads.
 func valueMap(o ordered) map[string]any {
 	m := map[string]any{}
